@@ -713,6 +713,16 @@
     ];
     const WRITE_UUID = 0xae01;
     const NOTIFY_UUID = 0xae02;
+    const DATA_UUID = 0xae03;
+    const ROW_BYTES = PRINT_WIDTH / 8;
+    const MIN_MXW01_DATA_BYTES = 90 * ROW_BYTES;
+    const MXW01_CMD = {
+      STATUS: 0xa1,
+      INTENSITY: 0xa2,
+      PRINT: 0xa9,
+      COMPLETE: 0xaa,
+      FLUSH: 0xad,
+    };
     const READY_NOTIFICATION = new Uint8Array([0x51, 0x78, 0xae, 0x01, 0x01, 0x00, 0x00, 0x00, 0xff]);
     const PRINT_SPEEDS = {
       short: { chunkSize: 100, chunkPause: 14, rowPause: 4, batchRows: 0, batchPause: 0 },
@@ -797,8 +807,11 @@
     let server = null;
     let writeChar = null;
     let notifyChar = null;
+    let dataChar = null;
+    let printerProtocol = "legacy";
     let readyResolve = null;
     let readyPromise = null;
+    let mxw01Waiters = new Map();
     let currentBitmap = null;
 
     window.addEventListener("error", (event) => {
@@ -816,6 +829,107 @@
       const stamp = new Date().toLocaleTimeString();
       els.log.textContent += `[${stamp}] ${line}\n`;
       els.log.scrollTop = els.log.scrollHeight;
+    }
+
+    const MXW01_NOTIFY_NAMES = {
+      [MXW01_CMD.STATUS]: "Статус принтера",
+      [MXW01_CMD.INTENSITY]: "Нагрев",
+      [MXW01_CMD.PRINT]: "Задание печати",
+      [MXW01_CMD.COMPLETE]: "Печать завершена",
+      0xab: "Батарея",
+      [MXW01_CMD.FLUSH]: "Сброс буфера",
+    };
+
+    const MXW01_STATE_NAMES = {
+      0: "ожидание",
+      1: "печатает",
+    };
+
+    const MXW01_ERROR_NAMES = {
+      1: "нет бумаги",
+      4: "перегрев",
+      8: "низкий заряд",
+      9: "нет бумаги",
+    };
+
+    function bytesToHex(bytes) {
+      return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(" ");
+    }
+
+    function describeMxw01Status(payload) {
+      const parts = [];
+      if (payload.length >= 7) {
+        const state = MXW01_STATE_NAMES[payload[6]] || `состояние ${payload[6]}`;
+        parts.push(state);
+      }
+      if (payload.length >= 10 && payload[9] > 0) {
+        parts.push(`заряд ~${payload[9]}%`);
+      }
+      if (payload.length >= 11 && payload[10] > 0) {
+        parts.push(`темп. ~${payload[10]}`);
+      }
+      if (payload.length >= 13) {
+        if (payload[12] === 0) {
+          parts.push("готов к печати");
+        } else {
+          const code = payload.length >= 14 ? payload[13] : payload[12];
+          parts.push(MXW01_ERROR_NAMES[code] || `ошибка 0x${code.toString(16)}`);
+        }
+      }
+      if (!parts.length) {
+        return payload.length ? `ответ (${payload.length} байт)` : "пустой ответ";
+      }
+      return parts.join(", ");
+    }
+
+    function describeMxw01Notification(value) {
+      if (value.length < 6 || value[0] !== 0x22 || value[1] !== 0x21) return null;
+      const cmdId = value[2];
+      const payloadLen = value[4] | (value[5] << 8);
+      const payloadEnd = 6 + payloadLen;
+      const payload = value.length >= payloadEnd ? value.slice(6, payloadEnd) : value.slice(6);
+      const title = MXW01_NOTIFY_NAMES[cmdId] || `Ответ 0x${cmdId.toString(16).toUpperCase()}`;
+      let detail;
+      switch (cmdId) {
+        case MXW01_CMD.STATUS:
+          detail = describeMxw01Status(payload);
+          break;
+        case MXW01_CMD.PRINT:
+          if (!payload.length) detail = "нет данных";
+          else if (payload[0] === 0) detail = "принято, передаём изображение";
+          else detail = `отклонено (код ${payload[0]})`;
+          break;
+        case MXW01_CMD.COMPLETE:
+          detail = "лист напечатан";
+          break;
+        case 0xab:
+          detail = payload.length ? `заряд ${payload[0]}%` : "нет данных";
+          break;
+        default:
+          detail = payload.length ? bytesToHex(payload) : "—";
+      }
+      return `${title}: ${detail}`;
+    }
+
+    function describeLegacyNotification(value) {
+      if (value.length < 2 || value[0] !== 0x51 || value[1] !== 0x78) return null;
+      if (value.length === READY_NOTIFICATION.length && READY_NOTIFICATION.every((b, i) => value[i] === b)) {
+        return "Fun Print: готов к печати";
+      }
+      if (value[2] === 0xae && value[3] === 0x01) {
+        if (value.length > 6 && value[6] === 0x00) return "Fun Print: готов";
+        return "Fun Print: ответ устройства";
+      }
+      return `Fun Print: ответ 0x${value[2].toString(16).toUpperCase()}`;
+    }
+
+    function logNotification(value) {
+      const readable = describeMxw01Notification(value) || describeLegacyNotification(value);
+      if (readable) {
+        log(readable);
+        return;
+      }
+      log(`Notify: ${bytesToHex(value)}`);
     }
 
     function setStatus(text, mode = "idle") {
@@ -1032,6 +1146,75 @@
       packet[i++] = crc8(body);
       packet[i++] = 0xff;
       return packet;
+    }
+
+    function buildMxw01Packet(commandId, payload) {
+      const body = new Uint8Array(payload);
+      const packet = new Uint8Array(2 + 1 + 1 + 2 + body.length + 1 + 1);
+      let i = 0;
+      packet[i++] = 0x22;
+      packet[i++] = 0x21;
+      packet[i++] = commandId;
+      packet[i++] = 0x00;
+      packet[i++] = body.length & 0xff;
+      packet[i++] = (body.length >> 8) & 0xff;
+      packet.set(body, i);
+      i += body.length;
+      packet[i++] = crc8(body);
+      packet[i++] = 0xff;
+      return packet;
+    }
+
+    function mxw01IntensityByte() {
+      const raw = Number(els.energyInput.value) || 65535;
+      const min = 12000;
+      const max = 65535;
+      return clamp(Math.round(((raw - min) / (max - min)) * 255), 0, 255);
+    }
+
+    function mxw01CmdStatus() {
+      return buildMxw01Packet(MXW01_CMD.STATUS, [0x00]);
+    }
+
+    function mxw01CmdIntensity(value) {
+      return buildMxw01Packet(MXW01_CMD.INTENSITY, [value & 0xff]);
+    }
+
+    function mxw01CmdPrintRequest(lineCount) {
+      return buildMxw01Packet(MXW01_CMD.PRINT, [
+        lineCount & 0xff,
+        (lineCount >> 8) & 0xff,
+        0x30,
+        0x00,
+      ]);
+    }
+
+    function mxw01CmdFlush() {
+      return buildMxw01Packet(MXW01_CMD.FLUSH, [0x00]);
+    }
+
+    function waitMxw01Notification(commandId, timeoutMs) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          mxw01Waiters.delete(commandId);
+          reject(new Error(`Нет ответа 0x${commandId.toString(16)} от принтера`));
+        }, timeoutMs);
+        mxw01Waiters.set(commandId, (payload) => {
+          clearTimeout(timer);
+          mxw01Waiters.delete(commandId);
+          resolve(payload);
+        });
+      });
+    }
+
+    function rowsToMxw01Buffer(rows) {
+      const lineCount = rows.length;
+      const size = Math.max(lineCount * ROW_BYTES, MIN_MXW01_DATA_BYTES);
+      const buffer = new Uint8Array(size);
+      for (let y = 0; y < lineCount; y += 1) {
+        buffer.set(rows[y], y * ROW_BYTES);
+      }
+      return { buffer, lineCount };
     }
 
     function concatPackets(packets) {
@@ -1507,12 +1690,23 @@
       setStatus("Открываю канал печати...", "idle");
       writeChar = await service.getCharacteristic(WRITE_UUID);
       notifyChar = await service.getCharacteristic(NOTIFY_UUID);
+      dataChar = null;
+      printerProtocol = "legacy";
+      try {
+        dataChar = await service.getCharacteristic(DATA_UUID);
+        printerProtocol = "mxw01";
+        log("Найден канал AE03 — протокол MXW01");
+      } catch (err) {
+        log(`AE03 не найден — протокол Fun Print: ${err.message}`);
+      }
       readyPromise = null;
       readyResolve = null;
+      mxw01Waiters.clear();
       await notifyChar.startNotifications();
       notifyChar.addEventListener("characteristicvaluechanged", onNotification);
 
-      setStatus(`Подключен: ${device.name || device.id}`, "ok");
+      const protocolLabel = printerProtocol === "mxw01" ? "MXW01" : "Fun Print";
+      setStatus(`Подключен (${protocolLabel}): ${device.name || device.id}`, "ok");
       localStorage.setItem("tinytape.lastDeviceId", device.id);
       localStorage.setItem("tinytape.lastDeviceName", device.name || "");
       updateUi();
@@ -1522,8 +1716,18 @@
     function onNotification(event) {
       const view = event.target.value;
       const value = new Uint8Array(view.buffer, view.byteOffset, view.byteLength);
-      const hex = Array.from(value, (b) => b.toString(16).padStart(2, "0")).join(" ");
-      log(`Notify: ${hex}`);
+      logNotification(value);
+      if (value.length >= 6 && value[0] === 0x22 && value[1] === 0x21) {
+        const cmdId = value[2];
+        const payloadLen = value[4] | (value[5] << 8);
+        const payloadEnd = 6 + payloadLen;
+        if (value.length >= payloadEnd) {
+          const payload = value.slice(6, payloadEnd);
+          const waiter = mxw01Waiters.get(cmdId);
+          if (waiter) waiter(payload);
+        }
+        return;
+      }
       if (value.length === READY_NOTIFICATION.length && READY_NOTIFICATION.every((b, i) => value[i] === b)) {
         if (readyResolve) {
           readyResolve();
@@ -1539,12 +1743,12 @@
       }
     }
 
-    async function writeChunk(chunk) {
-      if (!writeChar) throw new Error("Принтер не подключен");
-      if (writeChar.properties.writeWithoutResponse) {
-        await writeChar.writeValueWithoutResponse(chunk);
+    async function writeChunk(chunk, characteristic = writeChar) {
+      if (!characteristic) throw new Error("Принтер не подключен");
+      if (characteristic.properties.writeWithoutResponse) {
+        await characteristic.writeValueWithoutResponse(chunk);
       } else {
-        await writeChar.writeValue(chunk);
+        await characteristic.writeValue(chunk);
       }
     }
 
@@ -1555,6 +1759,50 @@
         if (profile.chunkPause > 0) {
           await sleep(profile.chunkPause);
         }
+      }
+    }
+
+    async function sendMxw01PrintJob(rows, profile) {
+      if (!writeChar || !dataChar) throw new Error("MXW01: нет канала данных AE03");
+      const { buffer, lineCount } = rowsToMxw01Buffer(rows);
+      const notifyTimeout = 7000;
+      const intensity = mxw01IntensityByte();
+      log(`MXW01: ${lineCount} строк, ${buffer.length} байт, нагрев 0x${intensity.toString(16)}`);
+
+      await sendBytes(mxw01CmdIntensity(intensity), profile);
+      await sleep(100);
+      await sendBytes(mxw01CmdStatus(), profile);
+      const statusPayload = await waitMxw01Notification(MXW01_CMD.STATUS, notifyTimeout);
+      if (statusPayload.length >= 13 && statusPayload[12] !== 0) {
+        const errorCode = statusPayload.length >= 14 ? statusPayload[13] : 0;
+        throw new Error(`Принтер не готов (код 0x${errorCode.toString(16)})`);
+      }
+
+      await sendBytes(mxw01CmdPrintRequest(lineCount), profile);
+      const printAck = await waitMxw01Notification(MXW01_CMD.PRINT, notifyTimeout);
+      if (!printAck.length || printAck[0] !== 0) {
+        throw new Error("Принтер отклонил задание печати");
+      }
+
+      const numChunks = Math.ceil(buffer.length / profile.chunkSize);
+      for (let offset = 0, chunkNum = 0; offset < buffer.length; offset += profile.chunkSize) {
+        chunkNum += 1;
+        const chunk = buffer.slice(offset, Math.min(buffer.length, offset + profile.chunkSize));
+        await writeChunk(chunk, dataChar);
+        if (profile.chunkPause > 0) await sleep(profile.chunkPause);
+        if (chunkNum % 50 === 0 || offset + profile.chunkSize >= buffer.length) {
+          setStatus(`Печать ${chunkNum}/${numChunks}`, "idle");
+        }
+      }
+
+      await sendBytes(mxw01CmdFlush(), profile);
+      await sleep(100);
+      const completeTimeout = Math.max(15000, lineCount * 80);
+      try {
+        await waitMxw01Notification(MXW01_CMD.COMPLETE, completeTimeout);
+        log("MXW01: печать завершена (AA).");
+      } catch (err) {
+        log(`MXW01: ${err.message} (возможно, печать всё же пошла)`);
       }
     }
 
@@ -1616,16 +1864,23 @@
       if (!server || !writeChar || !currentBitmap) return;
       const rows = currentBitmap.rows;
       const profile = PRINT_SPEEDS[els.printSpeedSelect.value] || PRINT_SPEEDS.safe;
-      const ready = waitForReady(Math.max(60000, rows.length * 80)).catch((err) => {
-        log(err.message);
-        return null;
-      });
-      const estimatedBytes = rows.length * (PRINT_WIDTH / 8 + 8);
-      log(`Печать: ${rows.length} строк, примерно ${estimatedBytes} байт, режим ${els.printSpeedSelect.value}`);
+      const protocolLabel = printerProtocol === "mxw01" ? "MXW01" : "Fun Print";
+      const estimatedBytes = printerProtocol === "mxw01"
+        ? Math.max(rows.length * ROW_BYTES, MIN_MXW01_DATA_BYTES)
+        : rows.length * (ROW_BYTES + 8);
+      log(`Печать (${protocolLabel}): ${rows.length} строк, ~${estimatedBytes} байт, режим ${els.printSpeedSelect.value}`);
       setStatus("Печать...", "idle");
-      await sendPrintJob(rows, profile);
-      await ready;
-      setStatus(`Подключен: ${device.name || device.id}`, "ok");
+      if (printerProtocol === "mxw01") {
+        await sendMxw01PrintJob(rows, profile);
+      } else {
+        const ready = waitForReady(Math.max(60000, rows.length * 80)).catch((err) => {
+          log(err.message);
+          return null;
+        });
+        await sendPrintJob(rows, profile);
+        await ready;
+      }
+      setStatus(`Подключен (${protocolLabel}): ${device.name || device.id}`, "ok");
       log("Задание отправлено.");
     }
 
@@ -1633,8 +1888,11 @@
       server = null;
       writeChar = null;
       notifyChar = null;
+      dataChar = null;
+      printerProtocol = "legacy";
       readyResolve = null;
       readyPromise = null;
+      mxw01Waiters.clear();
       setStatus("Отключен", "bad");
       updateUi();
       log("Принтер отключен.");
