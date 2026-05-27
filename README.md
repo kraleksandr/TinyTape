@@ -96,7 +96,7 @@ This project does not need a build step.
 7. Use `Растр` preview to check what will actually print.
 8. Press `Печатать`.
 
-For long prints, keep `Темп BLE` set to `Надежный`. If the printer stops after several centimeters, switch to `Очень медленный`.
+For short prints, keep `Режим печати` set to `Короткая`. If a long print stops after several centimeters, switch to `Длинная` or `Очень длинная`.
 
 ## Troubleshooting
 
@@ -110,7 +110,7 @@ If the printer does not appear:
 
 If printing stops halfway:
 
-- Use `Темп BLE -> Очень медленный`.
+- Use `Режим печати -> Длинная` or `Очень длинная`.
 - Lower the heat level slightly.
 - Try a shorter tape first.
 - Make sure the battery is charged.

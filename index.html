@@ -684,11 +684,11 @@
             </div>
           </label>
           <label>
-            Темп BLE
+            Режим печати
             <select id="printSpeedSelect">
-              <option value="safe" selected>Надежный</option>
-              <option value="slow">Очень медленный</option>
-              <option value="fast">Быстрый</option>
+              <option value="short" selected>Короткая</option>
+              <option value="safe">Длинная</option>
+              <option value="slow">Очень длинная</option>
             </select>
           </label>
           <div class="button-row">
@@ -715,7 +715,7 @@
     const NOTIFY_UUID = 0xae02;
     const READY_NOTIFICATION = new Uint8Array([0x51, 0x78, 0xae, 0x01, 0x01, 0x00, 0x00, 0x00, 0xff]);
     const PRINT_SPEEDS = {
-      fast: { chunkSize: 100, chunkPause: 14, rowPause: 4, batchRows: 96, batchPause: 180 },
+      short: { chunkSize: 100, chunkPause: 14, rowPause: 4, batchRows: 0, batchPause: 0 },
       safe: { chunkSize: 60, chunkPause: 18, rowPause: 16, batchRows: 48, batchPause: 420 },
       slow: { chunkSize: 40, chunkPause: 24, rowPause: 28, batchRows: 32, batchPause: 650 },
     };
@@ -1552,7 +1552,9 @@
       for (let offset = 0; offset < bytes.length; offset += profile.chunkSize) {
         const chunk = bytes.slice(offset, Math.min(bytes.length, offset + profile.chunkSize));
         await writeChunk(chunk);
-        await sleep(profile.chunkPause);
+        if (profile.chunkPause > 0) {
+          await sleep(profile.chunkPause);
+        }
       }
     }
 
@@ -1570,8 +1572,10 @@
 
       for (let index = 0; index < rows.length; index += 1) {
         await sendBytes(rowPacket(rows[index]), profile);
-        await sleep(profile.rowPause);
-        if ((index + 1) % profile.batchRows === 0) {
+        if (profile.rowPause > 0) {
+          await sleep(profile.rowPause);
+        }
+        if (profile.batchRows > 0 && (index + 1) % profile.batchRows === 0) {
           setStatus(`Печать ${index + 1}/${rows.length}`, "idle");
           log(`Отправлено строк: ${index + 1}/${rows.length}`);
           await sleep(profile.batchPause);
@@ -1617,7 +1621,7 @@
         return null;
       });
       const estimatedBytes = rows.length * (PRINT_WIDTH / 8 + 8);
-      log(`Печать: ${rows.length} строк, примерно ${estimatedBytes} байт, темп ${els.printSpeedSelect.value}`);
+      log(`Печать: ${rows.length} строк, примерно ${estimatedBytes} байт, режим ${els.printSpeedSelect.value}`);
       setStatus("Печать...", "idle");
       await sendPrintJob(rows, profile);
       await ready;
