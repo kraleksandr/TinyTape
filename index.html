@@ -132,6 +132,54 @@
     .dot.ok { background: var(--ok); }
     .dot.bad { background: var(--danger); }
 
+    .battery {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 36px;
+      padding: 8px 11px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .battery[hidden] { display: none; }
+
+    .battery.ok { color: var(--ok); border-color: #3d5a49; }
+    .battery.mid { color: var(--accent); border-color: #5a5546; }
+    .battery.low { color: var(--danger); border-color: #6a4038; }
+
+    .battery-bar {
+      width: 28px;
+      height: 10px;
+      border: 1px solid currentColor;
+      border-radius: 2px;
+      padding: 1px;
+      position: relative;
+    }
+
+    .battery-bar::after {
+      content: "";
+      position: absolute;
+      right: -4px;
+      top: 2px;
+      width: 2px;
+      height: 4px;
+      border-radius: 0 1px 1px 0;
+      background: currentColor;
+    }
+
+    .battery-fill {
+      display: block;
+      height: 100%;
+      border-radius: 1px;
+      background: currentColor;
+      width: 0%;
+    }
+
     .workspace {
       display: grid;
       grid-template-columns: 360px minmax(0, 1fr) 330px;
@@ -519,6 +567,10 @@
           <span class="dot" id="statusDot"></span>
           <span id="statusText">Не подключен</span>
         </div>
+        <div class="battery" id="batteryBadge" hidden title="Заряд батареи принтера">
+          <span class="battery-bar" aria-hidden="true"><span class="battery-fill" id="batteryFill"></span></span>
+          <span id="batteryText">—</span>
+        </div>
         <button class="primary" id="connectBtn">Подключить</button>
         <button id="disconnectBtn" disabled>Отключить</button>
         <button class="primary" id="printBtn" disabled>Печатать</button>
@@ -733,6 +785,9 @@
     const els = {
       statusDot: document.getElementById("statusDot"),
       statusText: document.getElementById("statusText"),
+      batteryBadge: document.getElementById("batteryBadge"),
+      batteryFill: document.getElementById("batteryFill"),
+      batteryText: document.getElementById("batteryText"),
       connectBtn: document.getElementById("connectBtn"),
       disconnectBtn: document.getElementById("disconnectBtn"),
       printBtn: document.getElementById("printBtn"),
@@ -812,6 +867,8 @@
     let readyResolve = null;
     let readyPromise = null;
     let mxw01Waiters = new Map();
+    let printerBattery = null;
+    let batteryFromAb = false;
     let currentBitmap = null;
 
     window.addEventListener("error", (event) => {
@@ -856,14 +913,65 @@
       return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join(" ");
     }
 
+    function parseMxw01Battery(payload, cmdId) {
+      if (cmdId === 0xab && payload.length) {
+        const level = payload[0];
+        if (level >= 1 && level <= 100) return level;
+      }
+      if (cmdId === MXW01_CMD.STATUS && payload.length >= 10) {
+        const level = payload[9];
+        if (level >= 1 && level <= 100) return level;
+      }
+      return null;
+    }
+
+    function setBatteryLevel(level) {
+      if (level === null || level === undefined) {
+        printerBattery = null;
+        batteryFromAb = false;
+        els.batteryBadge.hidden = true;
+        els.batteryBadge.classList.remove("ok", "mid", "low");
+        return;
+      }
+      printerBattery = clamp(Math.round(level), 0, 100);
+      els.batteryBadge.hidden = false;
+      els.batteryText.textContent = `${printerBattery}%`;
+      els.batteryFill.style.width = `${printerBattery}%`;
+      els.batteryBadge.classList.remove("ok", "mid", "low");
+      if (printerBattery <= 15) els.batteryBadge.classList.add("low");
+      else if (printerBattery >= 50) els.batteryBadge.classList.add("ok");
+      else els.batteryBadge.classList.add("mid");
+    }
+
+    function applyMxw01NotificationData(cmdId, payload) {
+      if (cmdId === 0xab) {
+        const battery = parseMxw01Battery(payload, cmdId);
+        if (battery !== null) {
+          batteryFromAb = true;
+          setBatteryLevel(battery);
+        }
+        return;
+      }
+      if (cmdId === MXW01_CMD.STATUS && !batteryFromAb) {
+        const battery = parseMxw01Battery(payload, cmdId);
+        if (battery !== null) setBatteryLevel(battery);
+      }
+    }
+
+    async function refreshPrinterBattery() {
+      if (!writeChar || printerProtocol !== "mxw01") return;
+      try {
+        await sendBytes(mxw01CmdBattery(), PRINT_SPEEDS.short);
+      } catch (err) {
+        log(`Не удалось запросить заряд: ${err.message}`);
+      }
+    }
+
     function describeMxw01Status(payload) {
       const parts = [];
       if (payload.length >= 7) {
         const state = MXW01_STATE_NAMES[payload[6]] || `состояние ${payload[6]}`;
         parts.push(state);
-      }
-      if (payload.length >= 10 && payload[9] > 0) {
-        parts.push(`заряд ~${payload[9]}%`);
       }
       if (payload.length >= 11 && payload[10] > 0) {
         parts.push(`темп. ~${payload[10]}`);
@@ -902,9 +1010,11 @@
         case MXW01_CMD.COMPLETE:
           detail = "лист напечатан";
           break;
-        case 0xab:
-          detail = payload.length ? `заряд ${payload[0]}%` : "нет данных";
+        case 0xab: {
+          const level = parseMxw01Battery(payload, cmdId);
+          detail = level !== null ? `заряд ${level}%` : "нет данных";
           break;
+        }
         default:
           detail = payload.length ? bytesToHex(payload) : "—";
       }
@@ -1191,6 +1301,10 @@
 
     function mxw01CmdFlush() {
       return buildMxw01Packet(MXW01_CMD.FLUSH, [0x00]);
+    }
+
+    function mxw01CmdBattery() {
+      return buildMxw01Packet(0xab, [0x00]);
     }
 
     function waitMxw01Notification(commandId, timeoutMs) {
@@ -1711,6 +1825,11 @@
       localStorage.setItem("tinytape.lastDeviceName", device.name || "");
       updateUi();
       log("Характеристики принтера готовы.");
+      if (printerProtocol === "mxw01") {
+        refreshPrinterBattery();
+      } else {
+        setBatteryLevel(null);
+      }
     }
 
     function onNotification(event) {
@@ -1723,6 +1842,7 @@
         const payloadEnd = 6 + payloadLen;
         if (value.length >= payloadEnd) {
           const payload = value.slice(6, payloadEnd);
+          applyMxw01NotificationData(cmdId, payload);
           const waiter = mxw01Waiters.get(cmdId);
           if (waiter) waiter(payload);
         }
@@ -1773,6 +1893,7 @@
       await sleep(100);
       await sendBytes(mxw01CmdStatus(), profile);
       const statusPayload = await waitMxw01Notification(MXW01_CMD.STATUS, notifyTimeout);
+      applyMxw01NotificationData(MXW01_CMD.STATUS, statusPayload);
       if (statusPayload.length >= 13 && statusPayload[12] !== 0) {
         const errorCode = statusPayload.length >= 14 ? statusPayload[13] : 0;
         throw new Error(`Принтер не готов (код 0x${errorCode.toString(16)})`);
@@ -1893,6 +2014,7 @@
       readyResolve = null;
       readyPromise = null;
       mxw01Waiters.clear();
+      setBatteryLevel(null);
       setStatus("Отключен", "bad");
       updateUi();
       log("Принтер отключен.");
